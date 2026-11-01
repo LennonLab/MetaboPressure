@@ -1,0 +1,381 @@
+---
+title: "Bacillus Growth and Headspace Pressure"
+output: html_document
+---
+
+This model starts at inoculation, after the bottles have equilibrated at the
+experimental temperature. It assumes a closed jar, fixed pH, glucose as the
+only modeled carbon source, and aerobic growth.
+
+## Setup and parameters
+
+
+
+
+# ------------------------------ Packages ----------------------------------
+if (!requireNamespace("deSolve", quietly = TRUE)) {
+  stop("Install deSolve first: install.packages('deSolve')")
+}
+library(deSolve)
+
+# ------------------------------ Conditions -------------------------------
+cfg <- list(
+  # Bottle and liquid
+  Vgas_L = 0.075,
+  Vliquid_L = 0.050,
+  pressure_initial_atm = 1.0,
+
+  # Temperature and pH
+  temp_C = 37,
+  pH = 7.5,
+
+  # Initial headspace: air
+  yO2_initial = 0.2095,
+  yCO2_initial = 0.0004,
+
+  # Medium and inoculum
+  glucose_mM = 20,
+  cells0_per_mL = 1e6,
+  cell_dry_mass_pg = 0.3,
+
+  # Growth and substrate use
+  K_glucose_g_L = 0.05,
+  K_O2_mol_L = 1e-5,
+  yield_B_glucose = 0.50,
+  maintenance_glucose_g_g_h = 0.005,
+  lag_time_h = 0.5,
+
+  # Oxygen-transfer scenarios
+  kLa_O2_values = c(0.5, 1, 3, 10, 30),
+
+  # Held fixed to isolate the effect of oxygen transfer
+  kLa_CO2_per_h = 10,
+
+  # Simulation
+  time_end_h = 24,
+  time_step_h = 0.05
+)
+
+Rgas_L_atm_mol_K <- 0.082057366
+Rgas_J_mol_K <- 8.314462618
+MW_glucose_g_mol <- 180.156
+MW_biomass_g_mol <- 113.117  # approximate C5H7O2N biomass formula
+
+# -------------------------- Temperature functions ------------------------
+# Henry coefficients vary with temperature using a van't Hoff approximation.
+# H25 is the coefficient at 25 C; deltaH_sol is an approximate dissolution
+# enthalpy in J/mol. These are simple temperature corrections, not fitted
+# parameters for this particular vessel.
+henry_at_temp <- function(H25, deltaH_sol_J_mol, temp_C) {
+  temp_K <- temp_C + 273.15
+  temp25_K <- 298.15
+
+  H25 * exp(
+    -deltaH_sol_J_mol / Rgas_J_mol_K *
+      (1 / temp_K - 1 / temp25_K)
+  )
+}
+
+# Water vapor pressure from the Antoine equation, returned in atm.
+water_vapor_pressure_atm <- function(temp_C) {
+  A <- 8.07131
+  B <- 1730.63
+  C <- 233.426
+
+  10^(A - B / (C + temp_C)) / 760
+}
+
+# Approximate carbonate pKa adjustments from 25 C.
+pKa1_at_temp <- function(temp_C) {
+  6.35 - 0.0017 * (temp_C - 25)
+}
+
+pKa2_at_temp <- function(temp_C) {
+  10.33 - 0.0065 * (temp_C - 25)
+}
+
+carbonate_alpha <- function(pH, pKa1, pKa2) {
+  1 + 10^(pH - pKa1) + 10^(2 * pH - pKa1 - pKa2)
+}
+
+cfg$temp_K <- cfg$temp_C + 273.15
+cfg$H_O2 <- henry_at_temp(
+  H25 = 0.0013,
+  deltaH_sol_J_mol = -12000,
+  temp_C = cfg$temp_C
+)
+cfg$H_CO2 <- henry_at_temp(
+  H25 = 0.033,
+  deltaH_sol_J_mol = -19000,
+  temp_C = cfg$temp_C
+)
+cfg$water_vapor_atm <- water_vapor_pressure_atm(cfg$temp_C)
+cfg$pKa1 <- pKa1_at_temp(cfg$temp_C)
+cfg$pKa2 <- pKa2_at_temp(cfg$temp_C)
+cfg$alpha_DIC <- carbonate_alpha(cfg$pH, cfg$pKa1, cfg$pKa2)
+
+# -------------------- Initial conditions and stoichiometry ----------------
+cfg$glucose0_g_L <- cfg$glucose_mM / 1000 * MW_glucose_g_mol
+
+# Convert cells/mL and cell dry mass to g biomass/L.
+cfg$B0_g_L <- cfg$cells0_per_mL * 1000 *
+  cfg$cell_dry_mass_pg * 1e-12
+
+# Estimate oxygen and CO2 per gram of biomass from a simple elemental balance:
+# glucose + ammonia -> biomass (C5H7O2N) + CO2 + water.
+n_biomass_per_glucose <- cfg$yield_B_glucose *
+  MW_glucose_g_mol / MW_biomass_g_mol
+
+co2_per_glucose <- 6 - 5 * n_biomass_per_glucose
+water_per_glucose <- 6 - 2 * n_biomass_per_glucose
+o2_per_glucose <- (
+  2 * n_biomass_per_glucose +
+    2 * co2_per_glucose +
+    water_per_glucose - 6
+) / 2
+
+cfg$qO2_growth_mol_g <- o2_per_glucose /
+  (cfg$yield_B_glucose * MW_glucose_g_mol)
+cfg$qCO2_growth_mol_g <- co2_per_glucose /
+  (cfg$yield_B_glucose * MW_glucose_g_mol)
+
+# Initial dry-gas pressure excludes water vapor.
+Pdry0_atm <- cfg$pressure_initial_atm - cfg$water_vapor_atm
+
+nO2_0_mol <- cfg$yO2_initial * Pdry0_atm * cfg$Vgas_L /
+  (Rgas_L_atm_mol_K * cfg$temp_K)
+nCO2_0_mol <- cfg$yCO2_initial * Pdry0_atm * cfg$Vgas_L /
+  (Rgas_L_atm_mol_K * cfg$temp_K)
+nInert_0_mol <- (1 - cfg$yO2_initial - cfg$yCO2_initial) *
+  Pdry0_atm * cfg$Vgas_L /
+  (Rgas_L_atm_mol_K * cfg$temp_K)
+
+# Assume the broth starts equilibrated with the air headspace.
+O0_mol_L <- cfg$H_O2 * cfg$yO2_initial * Pdry0_atm
+DIC0_mol_L <- cfg$alpha_DIC * cfg$H_CO2 *
+  cfg$yCO2_initial * Pdry0_atm
+
+# Approximate upper bound on biomass from the initial oxygen inventory.
+O2_initial_total_mol <- nO2_0_mol + O0_mol_L * cfg$Vliquid_L
+Bmax_from_O2_g_L <- cfg$B0_g_L +
+  O2_initial_total_mol /
+  (cfg$qO2_growth_mol_g * cfg$Vliquid_L)
+
+cat("Initial biomass:", signif(cfg$B0_g_L, 3), "g/L\n")
+cat("Initial glucose:", signif(cfg$glucose0_g_L, 3), "g/L\n")
+cat("Approximate biomass ceiling from initial O2:",
+    signif(Bmax_from_O2_g_L, 3), "g/L\n")
+
+# -------------------------------- ODE model --------------------------------
+run_model <- function(kLa_O2_per_h, doubling_min) {
+  mu_max_per_h <- log(2) / (doubling_min / 60)
+
+  initial_state <- c(
+    B = cfg$B0_g_L,
+    glucose = cfg$glucose0_g_L,
+    O = O0_mol_L,
+    DIC = DIC0_mol_L,
+    nO2 = nO2_0_mol,
+    nCO2 = nCO2_0_mol,
+    lag = 0,
+    O2_cumulative = 0
+  )
+
+  model <- function(time, state, parms) {
+    with(as.list(state), {
+      B_pos <- max(B, 0)
+      glucose_pos <- max(glucose, 0)
+      O_pos <- max(O, 0)
+      DIC_pos <- max(DIC, 0)
+      nO2_pos <- max(nO2, 0)
+      nCO2_pos <- max(nCO2, 0)
+      lag_pos <- min(max(lag, 0), 1)
+
+      pO2 <- nO2_pos * Rgas_L_atm_mol_K * cfg$temp_K / cfg$Vgas_L
+      pCO2 <- nCO2_pos * Rgas_L_atm_mol_K * cfg$temp_K / cfg$Vgas_L
+
+      f_glucose <- glucose_pos /
+        (cfg$K_glucose_g_L + glucose_pos)
+      f_O2 <- O_pos / (cfg$K_O2_mol_L + O_pos)
+
+      mu <- mu_max_per_h * lag_pos * f_glucose * f_O2
+      growth_g_L_h <- mu * B_pos
+
+      # Maintenance uses glucose and oxygen, but does not make new biomass.
+      maintenance_glucose_g_L_h <-
+        cfg$maintenance_glucose_g_g_h * B_pos * f_O2
+
+      glucose_use_g_L_h <- if (glucose_pos > 0) {
+        growth_g_L_h / cfg$yield_B_glucose +
+          maintenance_glucose_g_L_h
+      } else {
+        0
+      }
+
+      # Maintenance respiration assumes complete glucose oxidation.
+      maintenance_resp_mol_L_h <-
+        6 / MW_glucose_g_mol * maintenance_glucose_g_L_h
+
+      # Total respiration rates in mol/h for the bottle.
+      rO2_mol_h <- cfg$Vliquid_L * (
+        cfg$qO2_growth_mol_g * growth_g_L_h +
+          maintenance_resp_mol_L_h
+      )
+
+      rCO2_mol_h <- cfg$Vliquid_L * (
+        cfg$qCO2_growth_mol_g * growth_g_L_h +
+          maintenance_resp_mol_L_h
+      )
+
+      # Positive flux means gas moves from headspace into liquid.
+      J_O2_mol_h <- kLa_O2_per_h * cfg$Vliquid_L *
+        (cfg$H_O2 * pO2 - O_pos)
+
+      CO2_star_mol_L <- DIC_pos / cfg$alpha_DIC
+      J_CO2_mol_h <- cfg$kLa_CO2_per_h * cfg$Vliquid_L *
+        (cfg$H_CO2 * pCO2 - CO2_star_mol_L)
+
+      dB <- growth_g_L_h
+      dglucose <- -glucose_use_g_L_h
+      dO <- (J_O2_mol_h - rO2_mol_h) / cfg$Vliquid_L
+      dDIC <- (J_CO2_mol_h + rCO2_mol_h) / cfg$Vliquid_L
+      dnO2 <- -J_O2_mol_h
+      dnCO2 <- -J_CO2_mol_h
+      dlag <- (1 - lag_pos) / cfg$lag_time_h
+      dO2_cumulative <- rO2_mol_h
+
+      list(
+        c(dB, dglucose, dO, dDIC, dnO2, dnCO2, dlag, dO2_cumulative),
+        mu_per_h = mu,
+        O2_uptake_mol_h = rO2_mol_h,
+        pO2_headspace_atm = pO2,
+        pCO2_headspace_atm = pCO2
+      )
+    })
+  }
+
+  times_h <- seq(0, cfg$time_end_h, by = cfg$time_step_h)
+
+  out <- as.data.frame(deSolve::ode(
+    y = initial_state,
+    times = times_h,
+    func = model,
+    parms = NULL,
+    method = "lsoda"
+  ))
+
+  out$O_mg_L <- out$O * 32.00 * 1000
+  out$pO2_atm <- out$nO2 * Rgas_L_atm_mol_K *
+    cfg$temp_K / cfg$Vgas_L
+  out$pCO2_atm <- out$nCO2 * Rgas_L_atm_mol_K *
+    cfg$temp_K / cfg$Vgas_L
+
+  pN2_atm <- nInert_0_mol * Rgas_L_atm_mol_K *
+    cfg$temp_K / cfg$Vgas_L
+
+  out$pressure_atm <- out$pO2_atm + out$pCO2_atm +
+    pN2_atm + cfg$water_vapor_atm
+  out$pressure_change_mbar <-
+    (out$pressure_atm - out$pressure_atm[1]) * 1013.25
+
+  out
+}
+
+# ---------------------------- Run scenarios -------------------------------
+kLa_values <- cfg$kLa_O2_values
+doubling_values_min <- c(30, 40)
+
+scenario_outputs <- list()
+
+for (doubling_min in doubling_values_min) {
+  for (kLa in kLa_values) {
+    key <- paste(doubling_min, kLa, sep = "_")
+    scenario_outputs[[key]] <- run_model(
+      kLa_O2_per_h = kLa,
+      doubling_min = doubling_min
+    )
+  }
+}
+
+scenario_summary <- do.call(rbind, lapply(names(scenario_outputs), function(key) {
+  out <- scenario_outputs[[key]]
+  end <- nrow(out)
+  pieces <- strsplit(key, "_", fixed = TRUE)[[1]]
+
+  data.frame(
+    doubling_min = as.numeric(pieces[1]),
+    kLa_O2_per_h = as.numeric(pieces[2]),
+    biomass_24h_g_L = out$B[end],
+    glucose_24h_g_L = out$glucose[end],
+    dissolved_O2_24h_mg_L = out$O_mg_L[end],
+    headspace_pO2_24h_atm = out$pO2_atm[end],
+    pressure_change_24h_mbar = out$pressure_change_mbar[end]
+  )
+}))
+
+scenario_summary <- scenario_summary[
+  order(scenario_summary$doubling_min, scenario_summary$kLa_O2_per_h),
+]
+round(scenario_summary, 3)
+
+# ---------------------------------- Plots ----------------------------------
+# Plot one doubling-time setting at a time.
+doubling_min_to_plot <- 40
+
+plot_data <- lapply(kLa_values, function(kLa) {
+  key <- paste(doubling_min_to_plot, kLa, sep = "_")
+  scenario_outputs[[key]]
+})
+
+plot_colors <- c(
+  "#8c510a", "#d28e00", "#35978f", "#4c78a8", "#6a3d9a"
+)
+
+plot_panel <- function(variable, ylab, title, show_legend = FALSE) {
+  y <- do.call(cbind, lapply(plot_data, function(d) d[[variable]]))
+
+  matplot(
+    plot_data[[1]]$time, y,
+    type = "l",
+    lty = 1,
+    lwd = 2,
+    col = plot_colors,
+    xlab = "Time after inoculation (h)",
+    ylab = ylab,
+    main = title
+  )
+
+  if (show_legend) {
+    legend(
+      "topright",
+      legend = paste0("kLa O2 = ", kLa_values, " h-1"),
+      col = plot_colors,
+      lty = 1,
+      lwd = 2,
+      cex = 0.8,
+      bty = "n"
+    )
+  }
+}
+
+old_par <- par(no.readonly = TRUE)
+par(mfrow = c(2, 3), mar = c(4, 4, 3, 1))
+
+plot_panel("B", "Biomass (g/L)", "Biomass")
+plot_panel("glucose", "Glucose (g/L)", "Glucose")
+plot_panel("O_mg_L", "Dissolved O2 (mg/L)", "Dissolved oxygen")
+plot_panel("pO2_atm", "Headspace pO2 (atm)", "Headspace oxygen")
+plot_panel(
+  "pressure_change_mbar",
+  "Pressure change (mbar)",
+  "Pressure change"
+)
+plot_panel(
+  "O2_uptake_mol_h",
+  "O2 uptake (mol/h)",
+  "Respiration",
+  show_legend = TRUE
+)
+
+par(old_par)
+```
